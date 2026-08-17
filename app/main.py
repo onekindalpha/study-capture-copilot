@@ -49,13 +49,24 @@ DOTENV_LOADED = _load_dotenv(DOTENV_PATH, override=True)
 BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = BASE_DIR / "data"
 CAPTURE_DIR = DATA_DIR / "captures"
+DOCUMENT_DIR = DATA_DIR / "documents"
+DOCUMENT_TMP_DIR = DATA_DIR / "tmp_uploads"
 NOTES_PATH = DATA_DIR / "notes.jsonl"
 SESSIONS_PATH = DATA_DIR / "sessions.json"
 EXAMPLES_DIR = BASE_DIR / "examples"
 ARTICLE_TYPE_CONFIG_DIR = BASE_DIR / "configs" / "article_types"
 CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
+DOCUMENT_DIR.mkdir(parents=True, exist_ok=True)
+DOCUMENT_TMP_DIR.mkdir(parents=True, exist_ok=True)
 NOTES_PATH.touch(exist_ok=True)
 SESSIONS_PATH.touch(exist_ok=True)
+
+import sys as _sys  # noqa: E402 - local import kept next to the path setup it supports
+
+if str(BASE_DIR) not in _sys.path:
+    _sys.path.insert(0, str(BASE_DIR))
+
+from tools.document_ingest import convert_document_to_markdown  # noqa: E402
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
@@ -137,6 +148,18 @@ class QALog:
     learner_state: str
     resolved: bool
     used_in_article: bool
+
+
+@dataclass
+class DocumentEvidence:
+    document_id: int
+    timestamp: str
+    original_filename: str
+    ext: str
+    status: str  # "ok" | "error"
+    char_count: int
+    text_path: str | None = None
+    error: str | None = None
 
 
 class LLM:
@@ -3672,6 +3695,36 @@ def next_qa_id(session: dict[str, Any]) -> int:
     return (max(current) if current else 0) + 1
 
 
+def next_document_id(session: dict[str, Any]) -> int:
+    current = [int(item.get("document_id", 0)) for item in session.get("documents", [])]
+    return (max(current) if current else 0) + 1
+
+
+def session_document_evidence_text(session: dict[str, Any]) -> str:
+    """Read back the converted Markdown text for every successfully-ingested document.
+
+    Documents are stored as plain-text files on disk (see create_session_document); only the
+    small metadata record (filename, char count, status) lives in sessions.json. This joins
+    them back into one block of text so callers can fold it into the same evidence pool used
+    for screenshots and Q&A logs.
+    """
+    chunks: list[str] = []
+    for doc in session.get("documents", []):
+        if doc.get("status") != "ok" or not doc.get("text_path"):
+            continue
+        path = Path(str(doc["text_path"]))
+        if not path.exists():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if not text:
+            continue
+        chunks.append(f"[Document: {doc.get('original_filename', 'uploaded document')}]\n{text}")
+    return "\n\n".join(chunks)
+
+
 def append_qa_log(
     session: dict[str, Any],
     question: str,
@@ -6398,6 +6451,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.json(session.get("captures", []))
         if len(parts) == 4 and parts[3] == "qa":
             return self.json(session.get("qa_logs", []))
+        if len(parts) == 4 and parts[3] == "documents":
+            return self.json(session.get("documents", []))
         self.send_error(404)
 
     def handle_session_post(self, path: str) -> None:
@@ -6410,6 +6465,8 @@ class Handler(BaseHTTPRequestHandler):
         action = parts[3]
         if action == "captures":
             return self.create_session_capture(session)
+        if action == "documents":
+            return self.create_session_document(session)
         if action == "qa":
             data = self.read_json()
             qa = append_qa_log(
@@ -6437,15 +6494,31 @@ class Handler(BaseHTTPRequestHandler):
 
     def handle_session_delete(self, path: str) -> None:
         parts = path.strip("/").split("/")
-        if len(parts) != 5 or parts[3] != "captures":
+        if len(parts) != 5 or parts[3] not in ("captures", "documents"):
             return self.send_error(404)
         session = find_session(parts[2])
         if not session:
             return self.send_error(404)
-        capture_id = int(parts[4])
-        session["captures"] = [item for item in session.get("captures", []) if int(item.get("capture_id", 0)) != capture_id]
+        if parts[3] == "captures":
+            capture_id = int(parts[4])
+            session["captures"] = [item for item in session.get("captures", []) if int(item.get("capture_id", 0)) != capture_id]
+            update_session(session)
+            return self.json({"deleted": capture_id})
+        document_id = int(parts[4])
+        remaining = []
+        for item in session.get("documents", []):
+            if int(item.get("document_id", 0)) == document_id:
+                text_path = item.get("text_path")
+                if text_path:
+                    try:
+                        Path(str(text_path)).unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                continue
+            remaining.append(item)
+        session["documents"] = remaining
         update_session(session)
-        return self.json({"deleted": capture_id})
+        return self.json({"deleted": document_id})
 
     def create_session_capture(self, session: dict[str, Any]) -> None:
         form = parse_form(self)
@@ -6476,6 +6549,40 @@ class Handler(BaseHTTPRequestHandler):
         update_session(session)
         return self.json({"captures": created, "total": len(captures)})
 
+    def create_session_document(self, session: dict[str, Any]) -> None:
+        form = parse_form(self)
+        documents = session.setdefault("documents", [])
+        created: list[dict[str, Any]] = []
+        for item in get_files(form, "document"):
+            document_id = next_document_id(session)
+            conversion = convert_document_to_markdown(
+                file_bytes=item.data,
+                filename=item.filename,
+                tmp_dir=DOCUMENT_TMP_DIR,
+            )
+            text_path: str | None = None
+            if conversion["ok"]:
+                text_filename = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{document_id:03d}_{uuid.uuid4().hex[:8]}.md"
+                target = DOCUMENT_DIR / text_filename
+                target.write_text(conversion["text"], encoding="utf-8")
+                text_path = str(target)
+            document = asdict(
+                DocumentEvidence(
+                    document_id=document_id,
+                    timestamp=datetime.now().isoformat(timespec="seconds"),
+                    original_filename=item.filename,
+                    ext=conversion["ext"],
+                    status="ok" if conversion["ok"] else "error",
+                    char_count=conversion["char_count"],
+                    text_path=text_path,
+                    error=conversion["error"],
+                )
+            )
+            documents.append(document)
+            created.append(document)
+        update_session(session)
+        return self.json({"documents": created, "total": len(documents)})
+
     def generate_session_article(self, session: dict[str, Any]) -> None:
         captures = sorted(session.get("captures", []), key=lambda item: item.get("timestamp", ""))
         image_files = [CAPTURE_DIR / str(item.get("image_path", "")).removeprefix("/captures/") for item in captures if item.get("image_path")]
@@ -6483,19 +6590,29 @@ class Handler(BaseHTTPRequestHandler):
         memo = "\n".join(item.get("user_note", "") for item in captures if item.get("user_note"))
         qa_logs = session.get("qa_logs", [])
         qa_text = "\n\n".join(f"Q: {qa.get('question', '')}\nA: {qa.get('answer_summary', '')}" for qa in qa_logs)
+        document_text = session_document_evidence_text(session)
+        combined_raw_text = qa_text
+        extra_info = "Capture Timeline과 Q&A Logs를 함께 근거로 사용합니다."
+        if document_text:
+            combined_raw_text = f"{qa_text}\n\n{document_text}".strip() if qa_text else document_text
+            extra_info += " 업로드된 학습 문서(MarkItDown으로 변환된 원본 강의자료)도 근거로 포함되어 있으니, 문서 내용과 모순되는 내용을 만들지 마세요."
         topic = str(session.get("title") or "학습 캡처 타임라인 기반 문제 해결 경험")
         start = time.perf_counter()
         result = llm.synthesize_blog_from_capture(
-            raw_text=qa_text,
+            raw_text=combined_raw_text,
             memo=memo,
             image_files=image_files,
             topic=topic,
-            extra_info="Capture Timeline과 Q&A Logs를 함께 근거로 사용합니다.",
+            extra_info=extra_info,
             image_names=image_names,
             captures=captures,
             qa_logs=qa_logs,
         )
-        result.update({"elapsed_seconds": round(time.perf_counter() - start, 2), "image_count": len(image_files)})
+        result.update({
+            "elapsed_seconds": round(time.perf_counter() - start, 2),
+            "image_count": len(image_files),
+            "document_count": len([doc for doc in session.get("documents", []) if doc.get("status") == "ok"]),
+        })
         return self.json(result)
 
     def create_capture(self) -> None:
@@ -6690,6 +6807,7 @@ INDEX_HTML = """
     .capture-btn { width:68px; height:68px; border-radius:50%; border:4px solid #e9f8f3; background:var(--brand); box-shadow:0 10px 26px rgba(0,0,0,.35); padding:0; font-size:0; }
     .capture-btn::after { content:""; display:block; width:38px; height:38px; margin:11px auto; border-radius:50%; border:2px solid #06110e; }
     .ask-btn { width:52px; height:52px; border-radius:50%; padding:0; background:#f3c969; border-color:#6c5521; color:#151007; font-weight:900; }
+    .doc-btn { width:52px; height:52px; border-radius:50%; padding:0; background:#7aa2ff; border:2px solid #1f2d55; color:#0a0f1f; font-weight:900; font-size:11px; }
     .toast { position:fixed; right:24px; bottom:104px; background:#0e141d; border:1px solid var(--line); color:var(--text); padding:10px 12px; border-radius:8px; opacity:0; pointer-events:none; transition:opacity .2s; z-index:11; }
     .toast.show { opacity:1; }
     #captureInput { display:none; }
@@ -6755,9 +6873,11 @@ INDEX_HTML = """
 </main>
 <div class="floating-tools">
   <button id="askBtn" class="ask-btn" title="Ask Tutor">?</button>
+  <button id="docBtn" class="doc-btn" title="Upload Document">DOC</button>
   <button id="captureBtn" class="capture-btn" title="Capture"></button>
 </div>
 <input id="captureInput" type="file" accept="image/*" multiple />
+<input id="docInput" type="file" accept=".pdf,.docx,.pptx,.xlsx,.xls,.csv" multiple />
 <div id="toast" class="toast"></div>
 
 <script>
@@ -6770,6 +6890,7 @@ const debugTabs = document.querySelector("#debugTabs");
 const debugPane = document.querySelector("#debugPane");
 const toast = document.querySelector("#toast");
 const captureInput = document.querySelector("#captureInput");
+const docInput = document.querySelector("#docInput");
 let selectedFiles = [];
 let currentNoteIds = [];
 let currentSession = null;
@@ -6892,14 +7013,16 @@ async function ensureSession() {
 
 async function refreshTimeline() {
   if (!currentSession) return;
-  const [captures, qa] = await Promise.all([
+  const [captures, qa, documents] = await Promise.all([
     fetch(`/api/sessions/${currentSession.session_id}/captures`).then(r => r.json()),
-    fetch(`/api/sessions/${currentSession.session_id}/qa`).then(r => r.json())
+    fetch(`/api/sessions/${currentSession.session_id}/qa`).then(r => r.json()),
+    fetch(`/api/sessions/${currentSession.session_id}/documents`).then(r => r.json())
   ]);
   renderDebug({
     ...(lastDebug || {}),
     "Capture Timeline": captures,
-    "Q&A Logs": qa
+    "Q&A Logs": qa,
+    "Documents": documents
   });
 }
 
@@ -6909,6 +7032,7 @@ function renderDebug(payload) {
     ["Final Article", lastDebug.draft || result.textContent],
     ["Capture Timeline", lastDebug["Capture Timeline"] || lastDebug.capture_timeline || []],
     ["Q&A Logs", lastDebug["Q&A Logs"] || lastDebug.qa_logs || []],
+    ["Documents", lastDebug["Documents"] || lastDebug.documents || []],
     ["Image Evidence", lastDebug.image_evidence || []],
     ["Problem Map", lastDebug.problem_map || {}],
     ["Decision Map", lastDebug.decision_map || {}],
@@ -6945,6 +7069,29 @@ captureInput.onchange = async () => {
   const data = await res.json();
   captureInput.value = "";
   showToast(`Capture saved: 이미지 ${data.total}`);
+  await refreshTimeline();
+};
+
+document.querySelector("#docBtn").onclick = async () => {
+  await ensureSession();
+  docInput.click();
+};
+
+docInput.onchange = async () => {
+  await ensureSession();
+  if (!docInput.files.length) return;
+  const form = new FormData();
+  Array.from(docInput.files).forEach(file => form.append("document", file));
+  const res = await fetch(`/api/sessions/${currentSession.session_id}/documents`, { method:"POST", body:form });
+  const data = await res.json();
+  docInput.value = "";
+  const ok = (data.documents || []).filter(doc => doc.status === "ok").length;
+  const failed = (data.documents || []).filter(doc => doc.status !== "ok");
+  if (failed.length) {
+    showToast(`문서 업로드: 성공 ${ok}건, 실패 ${failed.length}건 (${failed[0].error || "변환 실패"})`);
+  } else {
+    showToast(`문서 업로드 완료: ${ok}건 (총 ${data.total})`);
+  }
   await refreshTimeline();
 };
 
